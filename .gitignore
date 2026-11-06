@@ -1,1 +1,4 @@
-/target
+target/
+cli_gui_form/
+
+*.lock

@@ -1,5 +1,5 @@
 [package]
-name = "demux"
+name = "demix"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,10 +7,10 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-ort = { version = "2.0.0-rc.9", features = ["cuda"] }
+ort = { version = "2.0.0-rc.15", features = ["copy-dylibs", "ndarray"] }
 rustfft = "6.2"
-ndarray = "0.15"
+ndarray = "0.17"
 symphonia = { version = "0.5", features = ["all"] }
 thiserror = "1.0"
 rayon = "1.10"
-hound = "3.5" # Thư viện ghi file WAV dễ dàng nhất trong Rust
+hound = "3.5"
