@@ -14,3 +14,8 @@ symphonia = { version = "0.5", features = ["all"] }
 thiserror = "1.0"
 rayon = "1.10"
 hound = "3.5"
+
+[dev-dependencies]
+cli_gui_form = { path = "cli_gui_form" }
+crossterm = "0.28"
+ratatui = "0.28"

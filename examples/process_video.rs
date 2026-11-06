@@ -1,6 +1,6 @@
-use demix::AudioSeparator;
+use demix::{AudioSeparator, DemixStage};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("==================================================");
@@ -15,77 +15,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // 2. Thư mục hoặc file video đầu vào
-    // Mặc định tìm file video trong thư mục video_input/
-    let video_input_folder = Path::new("video_input");
-    let target_video: Option<PathBuf> = if video_input_folder.is_file() {
-        Some(video_input_folder.to_path_buf())
-    } else {
-        // Tìm file video đầu tiên trong video_input
-        let mut found = None;
-        if let Ok(entries) = std::fs::read_dir(video_input_folder) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                    let ext_lower = ext.to_lowercase();
-                    if ["mp4", "mkv", "avi", "mov", "flv", "webm"].contains(&ext_lower.as_str()) {
-                        found = Some(path);
-                        break;
-                    }
-                }
-            }
-        }
-        found
-    };
-
-    let video_path = match target_video {
-        Some(path) => path,
-        None => {
-            eprintln!("Không tìm thấy video nào trong thư mục {:?}", video_input_folder);
-            return Ok(());
-        }
-    };
-
-    // 3. Cấu hình thư mục output và định dạng xuất
+    // 2. Đầu vào: Có thể là 1 file video, 1 file audio lẻ, HOẶC 1 thư mục chứa nhiều file
+    // Ví dụ:
+    //   - 1 file video: Path::new("video_input/第001集.mp4")
+    //   - 1 file audio: Path::new("video_input/song.mp3")
+    //   - Thư mục nhiều file: Path::new("video_input")
+    let input_target = Path::new("video_input");
     let output_dir = Path::new("output");
-    // Hỗ trợ: "mp3", "wav", hoặc "aac" (hoặc "acc")
-    let export_format = "mp3";
+    let export_format = "mp3"; // "mp3", "wav", hoặc "aac" (hoặc "acc")
 
     println!("-> Model       : {:?}", model_path);
-    println!("-> Input video : {:?}", video_path);
+    println!("-> Đầu vào     : {:?}", input_target);
     println!("-> Định dạng ra: {}", export_format);
     println!("-> Khởi tạo ONNX Session...");
 
     let separator = AudioSeparator::new(model_path)?;
     println!("-> Bắt đầu tiến trình xử lý:\n");
 
-    // 4. Gọi hàm process_video_with_progress với callback tiến độ trực quan
-    let (vocal_path, inst_path) = separator.process_video_with_progress(
-        &video_path,
+    // 3. Sử dụng separator.process_path:
+    // Tự động nhận diện nếu là 1 file đơn lẻ thì xử lý file đó,
+    // nếu là thư mục thì xử lý lần lượt tất cả các file video / audio tìm thấy.
+    let results = separator.process_path(
+        input_target,
         output_dir,
         export_format,
-        |progress| {
-            // Hiển thị thanh tiến trình trực quan ngay trên terminal
-            let bar_width: usize = 30;
-            let filled = ((progress.percentage / 100.0) * bar_width as f32) as usize;
-            let bar: String = "█".repeat(filled) + &"-".repeat(bar_width.saturating_sub(filled));
+        |file_path, progress| {
+            let file_name = file_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
 
-            print!(
-                "\r[{}] {:>5.1}% | {}",
-                bar, progress.percentage, progress.message
-            );
-            let _ = std::io::stdout().flush();
+            match &progress.stage {
+                DemixStage::ExtractAudio | DemixStage::LoadAudio => {
+                    // Giai đoạn chuẩn bị (chưa vào tính chunk)
+                    print!("\r[{}] -> {}", file_name, progress.message);
+                    let _ = std::io::stdout().flush();
+                }
+                DemixStage::Demixing { current_chunk, total_chunks } => {
+                    // TIẾN ĐỘ CHỈ TÍNH RIÊNG PHẦN CHUNK CHẠY ĐƯỢC (0% -> 100%)
+                    let bar_width: usize = 30;
+                    let filled = ((progress.percentage / 100.0) * bar_width as f32) as usize;
+                    let bar: String = "█".repeat(filled) + &"-".repeat(bar_width.saturating_sub(filled));
 
-            if progress.percentage >= 100.0 {
-                println!();
+                    print!(
+                        "\r[{}] [{}] {:>5.1}% | Chunk {}/{} | {}",
+                        file_name, bar, progress.percentage, current_chunk, total_chunks, progress.message
+                    );
+                    let _ = std::io::stdout().flush();
+                }
+                DemixStage::ExportAudio { file_name: out_f } => {
+                    print!("\r[{}] -> Đang xuất file {}...", file_name, out_f);
+                    let _ = std::io::stdout().flush();
+                }
+                DemixStage::Finished => {
+                    println!("\r[{}] [██████████████████████████████] 100.0% | Hoàn thành!", file_name);
+                }
             }
         },
     )?;
 
     println!("\n==================================================");
-    println!("-> TÁCH THÀNH CÔNG!");
-    println!("   - Vocal File        : {:?}", vocal_path);
-    println!("   - Instrumental File : {:?}", inst_path);
+    println!("-> TỔNG KẾT XỬ LÝ ({} file):", results.len());
+    for (idx, (vocal_path, inst_path)) in results.iter().enumerate() {
+        println!("   [{}]", idx + 1);
+        println!("       - Vocal        : {:?}", vocal_path);
+        println!("       - Instrumental : {:?}", inst_path);
+    }
     println!("==================================================");
 
     Ok(())

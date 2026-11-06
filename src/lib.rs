@@ -50,7 +50,11 @@ pub enum DemixStage {
 /// Thông tin tiến độ chuyển giao cho callback
 #[derive(Debug, Clone)]
 pub struct DemixProgress {
-    /// Tiến độ hoàn thành từ 0.0 đến 100.0%
+    /// Chunk hiện tại đang xử lý (0 nếu đang ở khâu trích xuất/đọc file)
+    pub current_chunk: usize,
+    /// Tổng số chunk cần xử lý
+    pub total_chunks: usize,
+    /// Tiến độ hoàn thành tính theo số chunk (0.0 đến 100.0%)
     pub percentage: f32,
     /// Giai đoạn hiện tại
     pub stage: DemixStage,
@@ -151,9 +155,11 @@ impl AudioSeparator {
 
         // 3. Trích xuất âm thanh từ Video sang WAV chuẩn (44.1kHz stereo PCM 16-bit)
         on_progress(DemixProgress {
-            percentage: 5.0,
+            current_chunk: 0,
+            total_chunks: 0,
+            percentage: 0.0,
             stage: DemixStage::ExtractAudio,
-            message: format!("Đang trích xuất audio từ video '{}' qua FFmpeg...", file_stem),
+            message: format!("Đang trích xuất audio từ '{}' qua FFmpeg...", file_stem),
         });
 
         let temp_pcm = target_dir.join("_extracted_temp.wav");
@@ -172,7 +178,9 @@ impl AudioSeparator {
 
         // 4. Đọc dữ liệu audio mẫu từ file PCM WAV tạm thời
         on_progress(DemixProgress {
-            percentage: 15.0,
+            current_chunk: 0,
+            total_chunks: 0,
+            percentage: 0.0,
             stage: DemixStage::LoadAudio,
             message: "Đang đọc và phân tích dữ liệu sóng âm...".to_string(),
         });
@@ -237,8 +245,12 @@ impl AudioSeparator {
         let vocal_out_path = target_dir.join(&vocal_filename);
         let inst_out_path = target_dir.join(&inst_filename);
 
+        let total_chunks = (left_channel.len() + 254976 - 1) / 254976;
+
         on_progress(DemixProgress {
-            percentage: 88.0,
+            current_chunk: total_chunks,
+            total_chunks,
+            percentage: 100.0,
             stage: DemixStage::ExportAudio {
                 file_name: vocal_filename.clone(),
             },
@@ -247,7 +259,9 @@ impl AudioSeparator {
         self.save_audio_file(&vocal_pcm, sample_rate, &vocal_out_path, norm_ext)?;
 
         on_progress(DemixProgress {
-            percentage: 95.0,
+            current_chunk: total_chunks,
+            total_chunks,
+            percentage: 100.0,
             stage: DemixStage::ExportAudio {
                 file_name: inst_filename.clone(),
             },
@@ -259,12 +273,74 @@ impl AudioSeparator {
         let _ = fs::remove_file(temp_pcm);
 
         on_progress(DemixProgress {
+            current_chunk: total_chunks,
+            total_chunks,
             percentage: 100.0,
             stage: DemixStage::Finished,
             message: "Tách âm thanh hoàn tất thành công!".to_string(),
         });
 
         Ok((vocal_out_path, inst_out_path))
+    }
+
+    /// Xử lý một file hoặc toàn bộ thư mục chứa các file video/audio
+    pub fn process_path<P1, P2, F>(
+        &self,
+        input_path: P1,
+        output_base_dir: P2,
+        format: &str,
+        mut on_progress: F,
+    ) -> Result<Vec<(PathBuf, PathBuf)>, SeparatorError>
+    where
+        P1: AsRef<Path>,
+        P2: AsRef<Path>,
+        F: FnMut(&Path, DemixProgress),
+    {
+        let path = input_path.as_ref();
+        let mut results = Vec::new();
+
+        let files: Vec<PathBuf> = if path.is_file() {
+            vec![path.to_path_buf()]
+        } else if path.is_dir() {
+            let mut list = Vec::new();
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_file() {
+                        if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                            let ext_lower = ext.to_lowercase();
+                            if [
+                                "mp4", "mkv", "avi", "mov", "flv", "webm", "ts", // Video
+                                "mp3", "wav", "aac", "flac", "m4a", "ogg", "wma", // Audio
+                            ]
+                            .contains(&ext_lower.as_str())
+                            {
+                                list.push(p);
+                            }
+                        }
+                    }
+                }
+            }
+            list.sort();
+            list
+        } else {
+            return Err(SeparatorError::IoError(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Đường dẫn không tồn tại: {:?}", path),
+            )));
+        };
+
+        for file in files {
+            let res = self.process_video_with_progress(
+                &file,
+                output_base_dir.as_ref(),
+                format,
+                |prog| on_progress(&file, prog),
+            )?;
+            results.push(res);
+        }
+
+        Ok(results)
     }
 
     /// Tách tín hiệu stereo (Left & Right) theo từng chunk qua MDX-Net
@@ -343,9 +419,11 @@ impl AudioSeparator {
             inst_left.extend_from_slice(&il_chunk[trim..trim + gen_size]);
             inst_right.extend_from_slice(&ir_chunk[trim..trim + gen_size]);
 
-            // Cập nhật tiến độ: giai đoạn Demixing từ 15% đến 85%
-            let progress_percent = 15.0 + 70.0 * ((k + 1) as f32 / num_chunks as f32);
+            // Cập nhật tiến độ: Chỉ tính theo tỷ lệ các chunk đã chạy (0.0% -> 100.0%)
+            let progress_percent = ((k + 1) as f32 / num_chunks as f32) * 100.0;
             on_progress(DemixProgress {
+                current_chunk: k + 1,
+                total_chunks: num_chunks,
                 percentage: progress_percent,
                 stage: DemixStage::Demixing {
                     current_chunk: k + 1,
