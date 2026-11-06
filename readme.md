@@ -6,3 +6,6 @@ curl.exe -L -o models/UVR-MDX-NET-Inst_HQ_3.onnx https://huggingface.co/seanghay
 curl.exe -L -o models/mdx_c_configs.json https://huggingface.co/audio-separator/models/resolve/main/mdx_c_configs.json
 
 ```
+
+Nếu muốn giọng sạch nhất thế giới hiện nay: Chọn Mel-Band Roformer (hoặc BS-Roformer).
+Nếu muốn bóc tách cả nhạc cụ lẫn hiệu ứng âm thanh (SFX): Chọn HT-Demucs v4.
