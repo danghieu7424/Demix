@@ -7,3 +7,4 @@ cli_gui_form/
 *.mp4
 *.wav
 *.acc
+*.onnx

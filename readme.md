@@ -7,7 +7,7 @@ mkdir -p models
 curl.exe -L -o models/UVR-MDX-NET-Inst_HQ_3.onnx https://huggingface.co/seanghay/uvr_models/resolve/main/UVR-MDX-NET-Inst_HQ_3.onnx
 
 # 2. Mô hình HT-Demucs v4 (Tách 4-stem: Drums, Bass, Other, Vocals hoặc gộp 2-stem)
-curl.exe -L -o models/htdemucs.onnx https://huggingface.co/kickvn/htdemucs-onnx/resolve/main/htdemucs.onnx
+curl.exe -L -o models/htdemucs.onnx https://huggingface.co/StemSplitio/htdemucs-onnx/resolve/main/htdemucs.onnx
 
 ```
 

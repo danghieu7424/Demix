@@ -934,6 +934,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_htdemucs_info() {
+        if Path::new("models/htdemucs.onnx").exists() {
+            let sep = AudioSeparator::new("models/htdemucs.onnx").unwrap();
+            let session = sep.session.lock().unwrap();
+            println!("HT-Demucs Inputs: {:?}", session.inputs());
+            println!("HT-Demucs Outputs: {:?}", session.outputs());
+            println!("Model kind: {:?}", sep.model_kind());
+        }
+    }
+
+    #[test]
     fn test_multi_chunk_tiling() {
         let n_fft = 6144;
         let hop = 1024;
