@@ -1,40 +1,52 @@
-use demix::{AudioSeparator, DemixStage};
+use demix::{AudioSeparator, DemixStage, OutputStems};
 use std::io::Write;
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("==================================================");
-    println!("     DEMIX - TÁCH VOCAL & INSTRUMENTAL TỪ VIDEO   ");
+    println!("     DEMIX - TÁCH VOCAL & INSTRUMENTAL (MDX / DEMUCS)");
     println!("==================================================");
 
-    // 1. Đường dẫn mô hình ONNX
-    let model_path = Path::new("models/UVR-MDX-NET-Inst_HQ_3.onnx");
-    if !model_path.exists() {
-        eprintln!("Lỗi: Không tìm thấy file model tại: {:?}", model_path);
-        eprintln!("Vui lòng tải model theo hướng dẫn trong readme.md!");
-        return Ok(());
-    }
+    // 1. Chọn mô hình AI:
+    // - Lựa chọn 1: MDX-Net Inst HQ 3 (mặc định 2-stem: vocal & instrumental, siêu nhanh CPU)
+    // - Lựa chọn 2: HT-Demucs v4 (tách 4-stem hoặc gộp 2-stem)
+    let model_mdx = Path::new("models/UVR-MDX-NET-Inst_HQ_3.onnx");
+    let model_demucs = Path::new("models/htdemucs.onnx");
 
-    // 2. Đầu vào: Có thể là 1 file video, 1 file audio lẻ, HOẶC 1 thư mục chứa nhiều file
-    // Ví dụ:
-    //   - 1 file video: Path::new("video_input/第001集.mp4")
-    //   - 1 file audio: Path::new("video_input/song.mp3")
-    //   - Thư mục nhiều file: Path::new("video_input")
+    // Chọn model cần dùng (tự động ưu tiên htdemucs nếu tồn tại và người dùng muốn, hoặc mdx)
+    let (model_path, _use_demucs) = if model_demucs.exists() {
+        (model_demucs, true)
+    } else if model_mdx.exists() {
+        (model_mdx, false)
+    } else {
+        eprintln!("Lỗi: Không tìm thấy model tại {:?} hoặc {:?}", model_mdx, model_demucs);
+        eprintln!("Vui lòng xem hướng dẫn tải model trong readme.md!");
+        return Ok(());
+    };
+
+    // 2. Đầu vào & Đầu ra
     let input_target = Path::new("video_input");
     let output_dir = Path::new("output");
-    let export_format = "mp3"; // "mp3", "wav", hoặc "aac" (hoặc "acc")
+    let export_format = "mp3"; // "mp3", "wav", hoặc "aac"
 
-    println!("-> Model       : {:?}", model_path);
-    println!("-> Đầu vào     : {:?}", input_target);
-    println!("-> Định dạng ra: {}", export_format);
-    println!("-> Khởi tạo ONNX Session...");
+    // 3. Cấu hình số track xuất ra:
+    // - OutputStems::TwoStems : Mặc định gộp thành 2 track (vocal & instrumental)
+    // - OutputStems::FourStems: Xuất đủ 4 track (drums, bass, other, vocals - chỉ áp dụng cho HT-Demucs)
+    let stems_mode = OutputStems::TwoStems; 
 
-    let separator = AudioSeparator::new(model_path)?;
+    println!("-> Mô hình sử dụng : {:?}", model_path);
+    println!("-> Chế độ xuất     : {:?}", stems_mode);
+    println!("-> Đầu vào         : {:?}", input_target);
+    println!("-> Định dạng xuất  : {}", export_format);
+    println!("-> Đang khởi tạo ONNX Session...");
+
+    let separator = AudioSeparator::new(model_path)?
+        .with_output_stems(stems_mode);
+
+    println!("   Loại mô hình tự nhận diện: {:?}", separator.model_kind());
     println!("-> Bắt đầu tiến trình xử lý:\n");
 
-    // 3. Sử dụng separator.process_path:
-    // Tự động nhận diện nếu là 1 file đơn lẻ thì xử lý file đó,
-    // nếu là thư mục thì xử lý lần lượt tất cả các file video / audio tìm thấy.
+    // 4. Xử lý đường dẫn (tự động nhận 1 video, 1 audio lẻ hoặc 1 thư mục chứa nhiều file)
     let results = separator.process_path(
         input_target,
         output_dir,
@@ -44,7 +56,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match &progress.stage {
                 DemixStage::ExtractAudio | DemixStage::LoadAudio => {
-                    // Giai đoạn chuẩn bị (chưa vào tính chunk)
                     print!("\r[{}] -> {}", file_name, progress.message);
                     let _ = std::io::stdout().flush();
                 }
@@ -72,11 +83,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     println!("\n==================================================");
-    println!("-> TỔNG KẾT XỬ LÝ ({} file):", results.len());
-    for (idx, (vocal_path, inst_path)) in results.iter().enumerate() {
-        println!("   [{}]", idx + 1);
-        println!("       - Vocal        : {:?}", vocal_path);
-        println!("       - Instrumental : {:?}", inst_path);
+    println!("-> TỔNG KẾT XỬ LÝ ({} file hoàn thành):", results.len());
+    for (idx, file_outputs) in results.iter().enumerate() {
+        println!("   [{}] File #{}", idx + 1, idx + 1);
+        for out_file in file_outputs {
+            println!("       - {:?}", out_file);
+        }
     }
     println!("==================================================");
 

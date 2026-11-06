@@ -1,4 +1,4 @@
-use ndarray::Array4;
+use ndarray::{Array3, Array4};
 use ort::{
     inputs,
     session::{builder::GraphOptimizationLevel, Session},
@@ -37,6 +37,25 @@ impl From<hound::Error> for SeparatorError {
     }
 }
 
+/// Loại mô hình phân tách
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelKind {
+    /// UVR-MDX-NET-Inst_HQ_3 (Tách 2-stem: Vocal & Instrumental, siêu nhanh CPU)
+    MdxNet,
+    /// HT-Demucs v4 (Mặc định gộp 2-stem hoặc xuất đủ 4-stem)
+    HtDemucs,
+}
+
+/// Số lượng track đầu ra (áp dụng khi dùng HT-Demucs)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputStems {
+    /// Mặc định: Gộp thành 2 file (vocal.<format> và instrumental.<format>)
+    #[default]
+    TwoStems,
+    /// Xuất đủ 4 file riêng biệt: drums, bass, other, vocals (chỉ áp dụng với HT-Demucs)
+    FourStems,
+}
+
 /// Các giai đoạn trong quá trình xử lý tách âm thanh
 #[derive(Debug, Clone, PartialEq)]
 pub enum DemixStage {
@@ -54,7 +73,7 @@ pub struct DemixProgress {
     pub current_chunk: usize,
     /// Tổng số chunk cần xử lý
     pub total_chunks: usize,
-    /// Tiến độ hoàn thành tính theo số chunk (0.0 đến 100.0%)
+    /// Tiến độ hoàn thành chỉ tính theo số chunk (0.0 đến 100.0%)
     pub percentage: f32,
     /// Giai đoạn hiện tại
     pub stage: DemixStage,
@@ -64,10 +83,12 @@ pub struct DemixProgress {
 
 pub struct AudioSeparator {
     session: Mutex<Session>,
+    model_kind: ModelKind,
+    output_stems: OutputStems,
 }
 
 impl AudioSeparator {
-    /// Khởi tạo AudioSeparator với đường dẫn file model ONNX (sử dụng tối đa số luồng CPU có sẵn)
+    /// Khởi tạo AudioSeparator với đường dẫn file model ONNX (tự động phát hiện loại mô hình và số luồng CPU)
     pub fn new<P: AsRef<Path>>(model_path: P) -> Result<Self, SeparatorError> {
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -90,15 +111,61 @@ impl AudioSeparator {
             .unwrap_or_else(|e| e.recover())
             .with_intra_threads(num_threads)
             .unwrap_or_else(|e| e.recover())
-            .commit_from_file(model_path)
+            .commit_from_file(model_path.as_ref())
             .map_err(|e| SeparatorError::OrtError(e.to_string()))?;
+
+        // Tự động nhận diện loại mô hình qua tên file hoặc cấu trúc input tensor
+        let model_kind = {
+            let path_str = model_path.as_ref().to_string_lossy().to_lowercase();
+            if path_str.contains("demucs") {
+                ModelKind::HtDemucs
+            } else if let Some(input) = session.inputs().first() {
+                if input.name() == "mix" {
+                    ModelKind::HtDemucs
+                } else {
+                    ModelKind::MdxNet
+                }
+            } else {
+                ModelKind::MdxNet
+            }
+        };
 
         Ok(Self {
             session: Mutex::new(session),
+            model_kind,
+            output_stems: OutputStems::TwoStems,
         })
     }
 
-    /// Xử lý video mặc định (không callback tiến độ)
+    /// Cấu hình số track xuất ra (TwoStems mặc định hoặc FourStems)
+    pub fn with_output_stems(mut self, stems: OutputStems) -> Self {
+        self.output_stems = stems;
+        self
+    }
+
+    pub fn set_output_stems(&mut self, stems: OutputStems) {
+        self.output_stems = stems;
+    }
+
+    /// Chỉ định tường minh loại model
+    pub fn with_model_kind(mut self, kind: ModelKind) -> Self {
+        self.model_kind = kind;
+        self
+    }
+
+    pub fn set_model_kind(&mut self, kind: ModelKind) {
+        self.model_kind = kind;
+    }
+
+    pub fn model_kind(&self) -> ModelKind {
+        self.model_kind
+    }
+
+    pub fn output_stems(&self) -> OutputStems {
+        self.output_stems
+    }
+
+    /// Xử lý video mặc định (trả về 2 file: vocal và instrumental)
     pub fn process_video<P1: AsRef<Path>, P2: AsRef<Path>>(
         &self,
         video_input: P1,
@@ -108,15 +175,38 @@ impl AudioSeparator {
         self.process_video_with_progress(video_input, output_base_dir, format, |_| {})
     }
 
-    /// Quy trình chính: Video Input -> output/.tmp/<file_name>/demix/ gồm vocal.<format> và instrumental.<format>
-    /// Đồng thời báo cáo tiến độ chi tiết qua closure `on_progress`
+    /// Quy trình chính: Video Input -> output/.tmp/<file_name>/demix/
+    /// Mặc định trả về (vocal_path, instrumental_path)
     pub fn process_video_with_progress<P1, P2, F>(
         &self,
         video_input: P1,
         output_base_dir: P2,
         format: &str,
-        mut on_progress: F,
+        on_progress: F,
     ) -> Result<(PathBuf, PathBuf), SeparatorError>
+    where
+        P1: AsRef<Path>,
+        P2: AsRef<Path>,
+        F: FnMut(DemixProgress),
+    {
+        let files = self.process_video_stems(video_input, output_base_dir, format, on_progress)?;
+        if files.len() >= 2 {
+            Ok((files[0].clone(), files[1].clone()))
+        } else if let Some(first) = files.first() {
+            Ok((first.clone(), first.clone()))
+        } else {
+            Err(SeparatorError::ShapeError("Không có file đầu ra nào được tạo".to_string()))
+        }
+    }
+
+    /// Xử lý video và xuất ra danh sách các file (2 file nếu TwoStems, hoặc 4 file nếu FourStems)
+    pub fn process_video_stems<P1, P2, F>(
+        &self,
+        video_input: P1,
+        output_base_dir: P2,
+        format: &str,
+        mut on_progress: F,
+    ) -> Result<Vec<PathBuf>, SeparatorError>
     where
         P1: AsRef<Path>,
         P2: AsRef<Path>,
@@ -126,11 +216,10 @@ impl AudioSeparator {
         if !video_path.exists() {
             return Err(SeparatorError::IoError(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("Không tìm thấy file video: {:?}", video_path),
+                format!("Không tìm thấy file: {:?}", video_path),
             )));
         }
 
-        // Chuẩn hóa định dạng mở rộng (hỗ trợ cả "acc" thay cho "aac")
         let format_lower = format.to_lowercase();
         let norm_ext = match format_lower.as_str() {
             "acc" | "aac" => "aac",
@@ -139,13 +228,11 @@ impl AudioSeparator {
             other => other,
         };
 
-        // 1. Lấy tên file video không chứa phần mở rộng (file_name / file_stem)
         let file_stem = video_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("media");
 
-        // 2. Tạo đường dẫn đích: output/.tmp/<file_name>/demix/
         let target_dir = output_base_dir
             .as_ref()
             .join(".tmp")
@@ -153,7 +240,6 @@ impl AudioSeparator {
             .join("demix");
         fs::create_dir_all(&target_dir)?;
 
-        // 3. Trích xuất âm thanh từ Video sang WAV chuẩn (44.1kHz stereo PCM 16-bit)
         on_progress(DemixProgress {
             current_chunk: 0,
             total_chunks: 0,
@@ -176,7 +262,6 @@ impl AudioSeparator {
             ));
         }
 
-        // 4. Đọc dữ liệu audio mẫu từ file PCM WAV tạm thời
         on_progress(DemixProgress {
             current_chunk: 0,
             total_chunks: 0,
@@ -222,65 +307,137 @@ impl AudioSeparator {
             (left, right, sample_rate)
         };
 
-        // 5. Phân tách âm thanh qua MDX-Net ONNX model (STFT -> Model -> ISTFT)
-        let (vocal_left, vocal_right, inst_left, inst_right) =
-            self.separate_stereo(&left_channel, &right_channel, &mut on_progress)?;
+        let mut output_paths = Vec::new();
 
-        // Ghép kênh Left - Right lại thành chuỗi interleaved stereo
-        let total_frames = vocal_left.len();
-        let mut vocal_pcm = Vec::with_capacity(total_frames * 2);
-        let mut inst_pcm = Vec::with_capacity(total_frames * 2);
+        match self.model_kind {
+            ModelKind::MdxNet => {
+                // Tách qua UVR-MDX-NET (STFT -> ONNX -> iSTFT)
+                let (vocal_left, vocal_right, inst_left, inst_right) =
+                    self.separate_stereo_mdx(&left_channel, &right_channel, &mut on_progress)?;
 
-        for i in 0..total_frames {
-            vocal_pcm.push(vocal_left[i]);
-            vocal_pcm.push(vocal_right[i]);
-            inst_pcm.push(inst_left[i]);
-            inst_pcm.push(inst_right[i]);
+                let total_frames = vocal_left.len();
+                let mut vocal_pcm = Vec::with_capacity(total_frames * 2);
+                let mut inst_pcm = Vec::with_capacity(total_frames * 2);
+
+                for i in 0..total_frames {
+                    vocal_pcm.push(vocal_left[i]);
+                    vocal_pcm.push(vocal_right[i]);
+                    inst_pcm.push(inst_left[i]);
+                    inst_pcm.push(inst_right[i]);
+                }
+
+                let vocal_filename = format!("vocal.{}", norm_ext);
+                let inst_filename = format!("instrumental.{}", norm_ext);
+
+                let vocal_out_path = target_dir.join(&vocal_filename);
+                let inst_out_path = target_dir.join(&inst_filename);
+
+                on_progress(DemixProgress {
+                    current_chunk: 100,
+                    total_chunks: 100,
+                    percentage: 100.0,
+                    stage: DemixStage::ExportAudio {
+                        file_name: vocal_filename.clone(),
+                    },
+                    message: format!("Đang xuất file Vocal ({}) ...", vocal_filename),
+                });
+                self.save_audio_file(&vocal_pcm, sample_rate, &vocal_out_path, norm_ext)?;
+
+                on_progress(DemixProgress {
+                    current_chunk: 100,
+                    total_chunks: 100,
+                    percentage: 100.0,
+                    stage: DemixStage::ExportAudio {
+                        file_name: inst_filename.clone(),
+                    },
+                    message: format!("Đang xuất file Instrumental ({}) ...", inst_filename),
+                });
+                self.save_audio_file(&inst_pcm, sample_rate, &inst_out_path, norm_ext)?;
+
+                output_paths.push(vocal_out_path);
+                output_paths.push(inst_out_path);
+            }
+            ModelKind::HtDemucs => {
+                // Tách qua HT-Demucs v4 (Raw Waveform -> ONNX 4-stems)
+                let stems_pcm =
+                    self.separate_stereo_demucs(&left_channel, &right_channel, &mut on_progress)?;
+
+                // 4 stems: 0 = drums, 1 = bass, 2 = other, 3 = vocals
+                if self.output_stems == OutputStems::FourStems {
+                    let stem_names = ["drums", "bass", "other", "vocals"];
+                    for (idx, name) in stem_names.iter().enumerate() {
+                        let filename = format!("{}.{}", name, norm_ext);
+                        let out_path = target_dir.join(&filename);
+
+                        on_progress(DemixProgress {
+                            current_chunk: 100,
+                            total_chunks: 100,
+                            percentage: 100.0,
+                            stage: DemixStage::ExportAudio {
+                                file_name: filename.clone(),
+                            },
+                            message: format!("Đang xuất file {} ({}) ...", name, filename),
+                        });
+
+                        self.save_audio_file(&stems_pcm[idx], sample_rate, &out_path, norm_ext)?;
+                        output_paths.push(out_path);
+                    }
+                } else {
+                    // Mặc định: Gộp 4 track thành 2 track: vocal và instrumental
+                    let total_samples = stems_pcm[0].len();
+                    let mut inst_pcm = Vec::with_capacity(total_samples);
+                    for i in 0..total_samples {
+                        // Instrumental = drums + bass + other
+                        let sum = stems_pcm[0][i] + stems_pcm[1][i] + stems_pcm[2][i];
+                        inst_pcm.push(sum);
+                    }
+                    let vocal_pcm = &stems_pcm[3];
+
+                    let vocal_filename = format!("vocal.{}", norm_ext);
+                    let inst_filename = format!("instrumental.{}", norm_ext);
+
+                    let vocal_out_path = target_dir.join(&vocal_filename);
+                    let inst_out_path = target_dir.join(&inst_filename);
+
+                    on_progress(DemixProgress {
+                        current_chunk: 100,
+                        total_chunks: 100,
+                        percentage: 100.0,
+                        stage: DemixStage::ExportAudio {
+                            file_name: vocal_filename.clone(),
+                        },
+                        message: format!("Đang xuất file Vocal ({}) ...", vocal_filename),
+                    });
+                    self.save_audio_file(vocal_pcm, sample_rate, &vocal_out_path, norm_ext)?;
+
+                    on_progress(DemixProgress {
+                        current_chunk: 100,
+                        total_chunks: 100,
+                        percentage: 100.0,
+                        stage: DemixStage::ExportAudio {
+                            file_name: inst_filename.clone(),
+                        },
+                        message: format!("Đang xuất file Instrumental gộp ({}) ...", inst_filename),
+                    });
+                    self.save_audio_file(&inst_pcm, sample_rate, &inst_out_path, norm_ext)?;
+
+                    output_paths.push(vocal_out_path);
+                    output_paths.push(inst_out_path);
+                }
+            }
         }
 
-        // 6. Xuất 2 file đầu ra: vocal.<format> và instrumental.<format>
-        let vocal_filename = format!("vocal.{}", norm_ext);
-        let inst_filename = format!("instrumental.{}", norm_ext);
-
-        let vocal_out_path = target_dir.join(&vocal_filename);
-        let inst_out_path = target_dir.join(&inst_filename);
-
-        let total_chunks = (left_channel.len() + 254976 - 1) / 254976;
-
-        on_progress(DemixProgress {
-            current_chunk: total_chunks,
-            total_chunks,
-            percentage: 100.0,
-            stage: DemixStage::ExportAudio {
-                file_name: vocal_filename.clone(),
-            },
-            message: format!("Đang xuất file Vocal ({}) ...", vocal_filename),
-        });
-        self.save_audio_file(&vocal_pcm, sample_rate, &vocal_out_path, norm_ext)?;
-
-        on_progress(DemixProgress {
-            current_chunk: total_chunks,
-            total_chunks,
-            percentage: 100.0,
-            stage: DemixStage::ExportAudio {
-                file_name: inst_filename.clone(),
-            },
-            message: format!("Đang xuất file Instrumental ({}) ...", inst_filename),
-        });
-        self.save_audio_file(&inst_pcm, sample_rate, &inst_out_path, norm_ext)?;
-
-        // Dọn dẹp file tạm
         let _ = fs::remove_file(temp_pcm);
 
         on_progress(DemixProgress {
-            current_chunk: total_chunks,
-            total_chunks,
+            current_chunk: 100,
+            total_chunks: 100,
             percentage: 100.0,
             stage: DemixStage::Finished,
             message: "Tách âm thanh hoàn tất thành công!".to_string(),
         });
 
-        Ok((vocal_out_path, inst_out_path))
+        Ok(output_paths)
     }
 
     /// Xử lý một file hoặc toàn bộ thư mục chứa các file video/audio
@@ -290,7 +447,7 @@ impl AudioSeparator {
         output_base_dir: P2,
         format: &str,
         mut on_progress: F,
-    ) -> Result<Vec<(PathBuf, PathBuf)>, SeparatorError>
+    ) -> Result<Vec<Vec<PathBuf>>, SeparatorError>
     where
         P1: AsRef<Path>,
         P2: AsRef<Path>,
@@ -310,8 +467,8 @@ impl AudioSeparator {
                         if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
                             let ext_lower = ext.to_lowercase();
                             if [
-                                "mp4", "mkv", "avi", "mov", "flv", "webm", "ts", // Video
-                                "mp3", "wav", "aac", "flac", "m4a", "ogg", "wma", // Audio
+                                "mp4", "mkv", "avi", "mov", "flv", "webm", "ts",
+                                "mp3", "wav", "aac", "flac", "m4a", "ogg", "wma",
                             ]
                             .contains(&ext_lower.as_str())
                             {
@@ -331,7 +488,7 @@ impl AudioSeparator {
         };
 
         for file in files {
-            let res = self.process_video_with_progress(
+            let res = self.process_video_stems(
                 &file,
                 output_base_dir.as_ref(),
                 format,
@@ -343,8 +500,8 @@ impl AudioSeparator {
         Ok(results)
     }
 
-    /// Tách tín hiệu stereo (Left & Right) theo từng chunk qua MDX-Net
-    fn separate_stereo<F>(
+    /// Tách tín hiệu stereo (Left & Right) qua mô hình UVR-MDX-NET
+    fn separate_stereo_mdx<F>(
         &self,
         left: &[f32],
         right: &[f32],
@@ -371,7 +528,6 @@ impl AudioSeparator {
         padded_left[pad_start..pad_start + total_samples].copy_from_slice(left);
         padded_right[pad_start..pad_start + total_samples].copy_from_slice(right);
 
-        // Chuẩn bị Hann window
         let window: Vec<f32> = (0..n_fft)
             .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n_fft as f32).cos()))
             .collect();
@@ -390,11 +546,9 @@ impl AudioSeparator {
             let chunk_l = &padded_left[chunk_start..chunk_start + chunk_size];
             let chunk_r = &padded_right[chunk_start..chunk_start + chunk_size];
 
-            // 1. Tính STFT cho từng kênh Left và Right
             let (l_real, l_imag) = Self::stft_chunk(chunk_l, n_fft, hop, dim_t, dim_f, trim, &window, &fft);
             let (r_real, r_imag) = Self::stft_chunk(chunk_r, n_fft, hop, dim_t, dim_f, trim, &window, &fft);
 
-            // 2. Tạo ndarray tensor kích thước [1, 4, 3072, 256]
             let mut input_spec = Array4::<f32>::zeros((1, 4, dim_f, dim_t));
             for f in 0..dim_f {
                 for t in 0..dim_t {
@@ -406,20 +560,16 @@ impl AudioSeparator {
                 }
             }
 
-            // 3. Chạy model ONNX inference
             let (vocal_spec, inst_spec) = self.separate_spectrogram(input_spec)?;
 
-            // 4. Invert STFT về lại tín hiệu audio thời gian
             let (vl_chunk, vr_chunk) = Self::istft_stereo(&vocal_spec, n_fft, hop, dim_t, dim_f, trim, &window, &ifft);
             let (il_chunk, ir_chunk) = Self::istft_stereo(&inst_spec, n_fft, hop, dim_t, dim_f, trim, &window, &ifft);
 
-            // 5. Cắt phần trung tâm gen_size loại bỏ viền lề
             vocal_left.extend_from_slice(&vl_chunk[trim..trim + gen_size]);
             vocal_right.extend_from_slice(&vr_chunk[trim..trim + gen_size]);
             inst_left.extend_from_slice(&il_chunk[trim..trim + gen_size]);
             inst_right.extend_from_slice(&ir_chunk[trim..trim + gen_size]);
 
-            // Cập nhật tiến độ: Chỉ tính theo tỷ lệ các chunk đã chạy (0.0% -> 100.0%)
             let progress_percent = ((k + 1) as f32 / num_chunks as f32) * 100.0;
             on_progress(DemixProgress {
                 current_chunk: k + 1,
@@ -430,7 +580,7 @@ impl AudioSeparator {
                     total_chunks: num_chunks,
                 },
                 message: format!(
-                    "Đang phân tách âm thanh qua AI (Chunk {}/{} - {:.1}%)",
+                    "Đang phân tách âm thanh qua MDX-Net (Chunk {}/{} - {:.1}%)",
                     k + 1,
                     num_chunks,
                     progress_percent
@@ -444,6 +594,139 @@ impl AudioSeparator {
         inst_right.truncate(total_samples);
 
         Ok((vocal_left, vocal_right, inst_left, inst_right))
+    }
+
+    /// Tách tín hiệu stereo (Left & Right) qua mô hình HT-Demucs v4 (trả về 4 track stereo interleaved)
+    fn separate_stereo_demucs<F>(
+        &self,
+        left: &[f32],
+        right: &[f32],
+        on_progress: &mut F,
+    ) -> Result<Vec<Vec<f32>>, SeparatorError>
+    where
+        F: FnMut(DemixProgress),
+    {
+        let total_samples = left.len();
+        let segment_len = 343980; // Chuẩn chunk size của HT-Demucs v4 (~7.8s @ 44.1kHz)
+        let overlap_ratio = 0.25f32;
+        let overlap_len = (segment_len as f32 * overlap_ratio) as usize; // 85995
+        let hop = segment_len - overlap_len; // 257985
+
+        // Tạo trọng số crossfade hình thang cho phần chồng lấn
+        let mut weight = vec![1.0f32; segment_len];
+        for i in 0..overlap_len {
+            let w = (i as f32 + 1.0) / (overlap_len as f32 + 1.0);
+            weight[i] = w;
+            weight[segment_len - 1 - i] = w;
+        }
+
+        let num_chunks = if total_samples <= segment_len {
+            1
+        } else {
+            (total_samples - overlap_len + hop - 1) / hop
+        };
+
+        // 4 stems: 0 = drums, 1 = bass, 2 = other, 3 = vocals
+        let mut out_left = vec![vec![0.0f32; total_samples]; 4];
+        let mut out_right = vec![vec![0.0f32; total_samples]; 4];
+        let mut weight_sum = vec![0.0f32; total_samples];
+
+        let (input_name, output_name) = {
+            let session = self
+                .session
+                .lock()
+                .map_err(|e| SeparatorError::ShapeError(e.to_string()))?;
+            let in_n = session
+                .inputs()
+                .first()
+                .map(|inp| inp.name().to_string())
+                .unwrap_or_else(|| "mix".to_string());
+            let out_n = session
+                .outputs()
+                .first()
+                .map(|out| out.name().to_string())
+                .unwrap_or_else(|| "output".to_string());
+            (in_n, out_n)
+        };
+
+        for k in 0..num_chunks {
+            let start = k * hop;
+            let end = (start + segment_len).min(total_samples);
+            let len = end - start;
+
+            let mut input_tensor_data = Array3::<f32>::zeros((1, 2, segment_len));
+            for i in 0..len {
+                input_tensor_data[[0, 0, i]] = left[start + i];
+                input_tensor_data[[0, 1, i]] = right[start + i];
+            }
+
+            let input_tensor = Value::from_array(input_tensor_data)?;
+
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|e| SeparatorError::ShapeError(e.to_string()))?;
+
+            let outputs = session.run(inputs![input_name.as_str() => input_tensor])?;
+
+            let output_extracted = outputs[output_name.as_str()].try_extract_tensor::<f32>()?;
+            let slice = output_extracted.1;
+
+            // Phân giải tensor [1, 4, 2, 343980] và cộng dồn trọng số
+            for s in 0..4 {
+                for i in 0..len {
+                    let w = weight[i];
+                    let idx_l = s * (2 * segment_len) + i;
+                    let idx_r = s * (2 * segment_len) + segment_len + i;
+
+                    out_left[s][start + i] += slice[idx_l] * w;
+                    out_right[s][start + i] += slice[idx_r] * w;
+                }
+            }
+
+            for i in 0..len {
+                weight_sum[start + i] += weight[i];
+            }
+
+            let progress_percent = ((k + 1) as f32 / num_chunks as f32) * 100.0;
+            on_progress(DemixProgress {
+                current_chunk: k + 1,
+                total_chunks: num_chunks,
+                percentage: progress_percent,
+                stage: DemixStage::Demixing {
+                    current_chunk: k + 1,
+                    total_chunks: num_chunks,
+                },
+                message: format!(
+                    "Đang phân tách âm thanh qua HT-Demucs (Chunk {}/{} - {:.1}%)",
+                    k + 1,
+                    num_chunks,
+                    progress_percent
+                ),
+            });
+        }
+
+        // Chuẩn hóa theo tổng trọng số
+        for i in 0..total_samples {
+            let ws = weight_sum[i].max(1e-6);
+            for s in 0..4 {
+                out_left[s][i] /= ws;
+                out_right[s][i] /= ws;
+            }
+        }
+
+        // Ghép kênh Left & Right thành mảng interleaved stereo cho từng stem
+        let mut stems_interleaved = Vec::with_capacity(4);
+        for s in 0..4 {
+            let mut pcm = Vec::with_capacity(total_samples * 2);
+            for i in 0..total_samples {
+                pcm.push(out_left[s][i]);
+                pcm.push(out_right[s][i]);
+            }
+            stems_interleaved.push(pcm);
+        }
+
+        Ok(stems_interleaved)
     }
 
     /// Tính STFT cho 1 đoạn audio (chunk)
@@ -560,7 +843,6 @@ impl AudioSeparator {
         )
         .map_err(|e| SeparatorError::ShapeError(e.to_string()))?;
 
-        // Với model UVR-MDX-NET-Inst_HQ_3, model dự đoán Instrumental -> Vocal = Input - Instrumental
         let vocal_tensor = &input_spec - &inst_tensor;
 
         Ok((vocal_tensor, inst_tensor))
@@ -657,9 +939,9 @@ mod tests {
         let hop = 1024;
         let dim_t = 256;
         let dim_f = 3072;
-        let chunk_size = hop * (dim_t - 1); // 261120
-        let trim = n_fft / 2; // 3072
-        let gen_size = chunk_size - 2 * trim; // 254976
+        let chunk_size = hop * (dim_t - 1);
+        let trim = n_fft / 2;
+        let gen_size = chunk_size - 2 * trim;
 
         let total_samples = 600_000;
         let signal: Vec<f32> = (0..total_samples)

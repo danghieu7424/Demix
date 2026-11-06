@@ -2,8 +2,12 @@
 ```powershell
 # Chạy trong thư mục gốc của dự án Rust (tải trực tiếp vào thư mục models/)
 mkdir -p models
+
+# 1. Mô hình UVR-MDX-NET-Inst_HQ_3 (Tách 2-stem: Vocal & Instrumental, siêu nhanh CPU)
 curl.exe -L -o models/UVR-MDX-NET-Inst_HQ_3.onnx https://huggingface.co/seanghay/uvr_models/resolve/main/UVR-MDX-NET-Inst_HQ_3.onnx
-curl.exe -L -o models/mdx_c_configs.json https://huggingface.co/audio-separator/models/resolve/main/mdx_c_configs.json
+
+# 2. Mô hình HT-Demucs v4 (Tách 4-stem: Drums, Bass, Other, Vocals hoặc gộp 2-stem)
+curl.exe -L -o models/htdemucs.onnx https://huggingface.co/kickvn/htdemucs-onnx/resolve/main/htdemucs.onnx
 
 ```
 
