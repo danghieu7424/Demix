@@ -1,4 +1,9 @@
+output/
 target/
 cli_gui_form/
 
 *.lock
+*.mp3
+*.mp4
+*.wav
+*.acc
