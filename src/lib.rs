@@ -88,6 +88,66 @@ pub struct AudioSeparator {
 }
 
 impl AudioSeparator {
+    /// Kiểm tra xem file model đã tồn tại chưa, nếu chưa có thì tự động tải về theo hướng dẫn trong readme.md
+    pub fn ensure_model<P: AsRef<Path>>(model_path: P) -> Result<PathBuf, SeparatorError> {
+        let path = model_path.as_ref();
+        if path.exists() {
+            if let Ok(meta) = fs::metadata(path) {
+                if meta.len() > 1024 * 1024 {
+                    return Ok(path.to_path_buf());
+                }
+            }
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let download_url = if file_name.contains("demucs") {
+            "https://huggingface.co/StemSplitio/htdemucs-onnx/resolve/main/htdemucs.onnx"
+        } else {
+            "https://huggingface.co/seanghay/uvr_models/resolve/main/UVR-MDX-NET-Inst_HQ_3.onnx"
+        };
+
+        println!("[Demix] File model không tồn tại tại {:?}", path);
+        println!("[Demix] Đang tự động tải model từ: {}", download_url);
+
+        let status = Command::new("curl.exe")
+            .args(["-L", "--progress-bar", "-o"])
+            .arg(path)
+            .arg(download_url)
+            .status()
+            .map_err(|e| {
+                SeparatorError::FffmpegError(format!("Không thể chạy lệnh curl.exe để tải model: {}", e))
+            })?;
+
+        if !status.success() {
+            return Err(SeparatorError::FffmpegError(
+                "Lỗi: Quá trình tải model qua curl.exe thất bại!".to_string(),
+            ));
+        }
+
+        let meta = fs::metadata(path)?;
+        if meta.len() < 1024 * 1024 {
+            let _ = fs::remove_file(path);
+            return Err(SeparatorError::ShapeError(
+                "Lỗi: Dung lượng file tải về bất thường (file hỏng hoặc lỗi đường link)!".to_string(),
+            ));
+        }
+
+        println!(
+            "[Demix] Tải model thành công! Dung lượng: {:.2} MB",
+            meta.len() as f64 / (1024.0 * 1024.0)
+        );
+        Ok(path.to_path_buf())
+    }
+
     /// Khởi tạo AudioSeparator với đường dẫn file model ONNX (tự động phát hiện loại mô hình và số luồng CPU)
     pub fn new<P: AsRef<Path>>(model_path: P) -> Result<Self, SeparatorError> {
         let threads = std::thread::available_parallelism()
@@ -101,6 +161,11 @@ impl AudioSeparator {
         model_path: P,
         num_threads: usize,
     ) -> Result<Self, SeparatorError> {
+        let model_path_ref = model_path.as_ref();
+        if !model_path_ref.exists() {
+            Self::ensure_model(model_path_ref)?;
+        }
+
         let env = ort::init()
             .build()
             .map_err(|e| SeparatorError::OrtError(e.to_string()))?;
@@ -111,7 +176,7 @@ impl AudioSeparator {
             .unwrap_or_else(|e| e.recover())
             .with_intra_threads(num_threads)
             .unwrap_or_else(|e| e.recover())
-            .commit_from_file(model_path.as_ref())
+            .commit_from_file(model_path_ref)
             .map_err(|e| SeparatorError::OrtError(e.to_string()))?;
 
         // Tự động nhận diện loại mô hình qua tên file hoặc cấu trúc input tensor

@@ -13,16 +13,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_mdx = Path::new("models/UVR-MDX-NET-Inst_HQ_3.onnx");
     let model_demucs = Path::new("models/htdemucs.onnx");
 
-    // Chọn model cần dùng (tự động ưu tiên htdemucs nếu tồn tại và người dùng muốn, hoặc mdx)
-    let (model_path, _use_demucs) = if model_demucs.exists() {
-        (model_demucs, true)
-    } else if model_mdx.exists() {
-        (model_mdx, false)
+    // Chọn model cần dùng (ví dụ: model_mdx hoặc model_demucs)
+    let chosen_model = if model_demucs.exists() {
+        model_demucs
     } else {
-        eprintln!("Lỗi: Không tìm thấy model tại {:?} hoặc {:?}", model_mdx, model_demucs);
-        eprintln!("Vui lòng xem hướng dẫn tải model trong readme.md!");
-        return Ok(());
+        model_mdx
     };
+
+    // Tự động tải model nếu chưa có trên máy theo lệnh hướng dẫn ở readme.md
+    if !chosen_model.exists() {
+        println!("Chưa tìm thấy model tại {:?}. Đang tự động tải về theo hướng dẫn readme.md...", chosen_model);
+        AudioSeparator::ensure_model(chosen_model)?;
+    }
+    let model_path = chosen_model;
 
     // 2. Đầu vào & Đầu ra
     let input_target = Path::new("video_input");
